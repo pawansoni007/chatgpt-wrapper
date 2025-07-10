@@ -8,8 +8,15 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import sys
 import os
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Add the current directory and parent directory to Python path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+parent_dir = os.path.dirname(current_dir)
+sys.path.append(current_dir)
+sys.path.append(parent_dir)
+
 from conversation_memory import EnhancedConversationManager
+from thread_detection_system import ThreadAwareConversationManager
 from models.chat_models import ChatRequest, ChatResponse, ConversationSummary
 
 import redis
@@ -21,7 +28,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Chat Wrapper API", version="1.0.0")
+app = FastAPI(title="Chat Wrapper API with Thread Detection", version="2.0.0 - Phase 3B")
 
 #region Add CORS middleware
 app.add_middleware(
@@ -415,10 +422,10 @@ class ConversationManager:
 # Initialize conversation manager
 conv_manager = ConversationManager()
 
-# Initialize enhanced manager
-enhanced_conv_manager = EnhancedConversationManager(
-    conv_manager, 
-    cerebras_client, 
+# Initialize Phase 3B Thread-Aware Manager
+thread_aware_manager = ThreadAwareConversationManager(
+    conv_manager,
+    cohere_client, 
     redis_client
 )
 
@@ -428,26 +435,29 @@ enhanced_conv_manager = EnhancedConversationManager(
 async def root():
     """Health check endpoint"""
     return {
-        "message": "Chat Wrapper API is running!",
-        "version": "1.0.0",
+        "message": "Chat Wrapper API with Thread Detection is running!",
+        "version": "2.0.0 - Phase 3B",
+        "features": ["Thread Detection", "Topic Lifecycle", "Context Selection"],
         "redis_connected": redis_client.ping()
     }
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Enhanced chat endpoint with conversation memory"""
+    """Enhanced chat endpoint with thread-aware conversation management"""
     
     conv_id = request.conversation_id or conv_manager.generate_conversation_id()
     
     try:
-        # Use enhanced context preparation with memory
-        context, estimated_tokens = enhanced_conv_manager.prepare_context_with_memory(conv_id, request.message)
+        # Use thread-aware context preparation (Phase 3B)
+        context, estimated_tokens = thread_aware_manager.prepare_context_with_threads(conv_id, request.message)
+        
+        print(f"🧵 Thread-aware context prepared: {len(context)} messages, {estimated_tokens} tokens")
         
         # Get response from Cerebras
         response_content, actual_tokens = await conv_manager.get_cerebras_response(context)
         
-        # Save exchange WITH memory tracking
-        await enhanced_conv_manager.add_exchange_with_memory(conv_id, request.message, response_content)
+        # Save exchange WITH thread tracking (Phase 3B)
+        thread_aware_manager.add_exchange_with_threads(conv_id, request.message, response_content)
         
         # Get updated conversation count
         conversation = conv_manager.get_conversation(conv_id)
@@ -466,22 +476,41 @@ async def chat(request: ChatRequest):
 
 @app.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str):
-    """Get full conversation history"""
+    """Get full conversation history with thread information"""
     conversation = conv_manager.get_conversation(conversation_id)
     metadata = conv_manager.get_conversation_metadata(conversation_id)
     
     if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
     
+    # Get thread information
+    threads = thread_aware_manager.lifecycle_manager.load_threads(conversation_id)
+    thread_info = []
+    
+    for thread in threads:
+        thread_info.append({
+            "thread_id": thread.thread_id,
+            "topic": thread.topic,
+            "status": thread.status.value,
+            "message_indices": thread.messages,
+            "confidence": thread.confidence_score
+        })
+    
     return {
         "conversation_id": conversation_id,
         "messages": conversation,
-        "metadata": metadata
+        "metadata": metadata,
+        "threads": thread_info,
+        "thread_summary": {
+            "total_threads": len(threads),
+            "active_threads": len([t for t in threads if t.status.value == "active"]),
+            "topics": [t.topic for t in threads if t.status.value == "active"]
+        }
     }
 
 @app.delete("/conversations/{conversation_id}")
 async def delete_conversation(conversation_id: str):
-    """Delete a conversation"""
+    """Delete a conversation and all associated data"""
     try:
         # Delete conversation and metadata
         redis_client.delete(conv_manager.get_conversation_key(conversation_id))
@@ -491,14 +520,21 @@ async def delete_conversation(conversation_id: str):
         embedding_keys = redis_client.keys(f"embedding:{conversation_id}:*")
         if embedding_keys:
             redis_client.delete(*embedding_keys)
+        
+        # Delete threads (Phase 3B)
+        redis_client.delete(thread_aware_manager.lifecycle_manager.get_threads_key(conversation_id))
+        
+        # Delete memory if exists
+        memory_key = f"memory:{conversation_id}"
+        redis_client.delete(memory_key)
             
-        return {"message": "Conversation deleted successfully"}
+        return {"message": "Conversation and all associated data deleted successfully"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/conversations")
 async def list_conversations():
-    """List all conversations (basic implementation)"""
+    """List all conversations with thread information"""
     try:
         # Get all conversation keys
         keys = redis_client.keys("metadata:*")
@@ -508,14 +544,110 @@ async def list_conversations():
             conv_id = key.replace("metadata:", "")
             metadata = conv_manager.get_conversation_metadata(conv_id)
             if metadata:
-                conversations.append({
+                # Get thread summary
+                threads = thread_aware_manager.lifecycle_manager.load_threads(conv_id)
+                
+                conv_data = {
                     "conversation_id": conv_id,
                     "message_count": metadata.get("message_count", 0),
                     "created_at": metadata.get("created_at"),
-                    "last_updated": metadata.get("last_updated")
-                })
+                    "last_updated": metadata.get("last_updated"),
+                    "thread_count": len(threads),
+                    "active_threads": len([t for t in threads if t.status.value == "active"]),
+                    "topics": [t.topic for t in threads if t.status.value == "active"][:3]  # First 3 active topics
+                }
+                conversations.append(conv_data)
         
         return {"conversations": conversations}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/conversations/{conversation_id}/threads")
+async def get_conversation_threads(conversation_id: str):
+    """Get conversation threads analysis"""
+    try:
+        # Load threads
+        threads = thread_aware_manager.lifecycle_manager.load_threads(conversation_id)
+        
+        if not threads:
+            # Analyze conversation to create threads
+            threads = thread_aware_manager.analyze_conversation_threads(conversation_id)
+            thread_aware_manager.lifecycle_manager.save_threads(conversation_id, threads)
+        
+        # Convert to serializable format
+        threads_data = []
+        for thread in threads:
+            thread_data = thread.to_dict()
+            # Add some additional info
+            thread_data["message_count"] = len(thread.messages)
+            thread_data["is_active"] = thread.status.value == "active"
+            threads_data.append(thread_data)
+        
+        return {
+            "conversation_id": conversation_id,
+            "threads": threads_data,
+            "total_threads": len(threads_data),
+            "active_threads": len([t for t in threads if t.status.value == "active"])
+        }
+        
+    except Exception as e:
+        print(f"Error getting threads: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/conversations/{conversation_id}/reanalyze-threads")
+async def reanalyze_conversation_threads(conversation_id: str):
+    """Force re-analysis of conversation threads"""
+    try:
+        # Re-analyze the conversation
+        threads = thread_aware_manager.analyze_conversation_threads(conversation_id)
+        
+        # Save the new threads
+        thread_aware_manager.lifecycle_manager.save_threads(conversation_id, threads)
+        
+        return {
+            "message": "Conversation threads re-analyzed successfully",
+            "conversation_id": conversation_id,
+            "threads_created": len(threads),
+            "threads": [{"id": t.thread_id, "topic": t.topic, "messages": len(t.messages)} for t in threads]
+        }
+        
+    except Exception as e:
+        print(f"Error re-analyzing threads: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/debug/threads/{conversation_id}")
+async def debug_thread_detection(conversation_id: str):
+    """Debug endpoint to see how thread detection works"""
+    try:
+        conversation = conv_manager.get_conversation(conversation_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        # Get topic boundaries
+        boundaries = thread_aware_manager.boundary_detector.detect_topic_boundaries(conversation)
+        
+        # Get conversation patterns
+        patterns = thread_aware_manager.boundary_detector.detect_conversation_patterns(conversation)
+        
+        # Get threads
+        threads = thread_aware_manager.lifecycle_manager.load_threads(conversation_id)
+        
+        return {
+            "conversation_id": conversation_id,
+            "message_count": len(conversation),
+            "detected_boundaries": boundaries,
+            "conversation_patterns": patterns,
+            "threads": [
+                {
+                    "id": t.thread_id,
+                    "topic": t.topic,
+                    "status": t.status.value,
+                    "messages": t.messages,
+                    "confidence": t.confidence_score
+                } for t in threads
+            ]
+        }
+        
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
