@@ -101,6 +101,9 @@ class TopicBoundaryDetector:
         boundaries = []
         embeddings = []
         
+        # First, get conversation patterns
+        patterns = self.detect_conversation_patterns(messages)
+        
         # Generate embeddings for all messages
         for msg in messages:
             content = msg.get("content", "")
@@ -110,8 +113,20 @@ class TopicBoundaryDetector:
             else:
                 embeddings.append([])
         
-        # Sliding window analysis
+        # Sliding window analysis with pattern override
         for i in range(self.window_size, len(messages)):
+            
+            # Check for explicit continuation signals first
+            if i in patterns["continuation_signals"]:
+                print(f"Continuation signal detected at message {i} - skipping boundary")
+                continue  # Skip boundary detection for continuations
+                
+            # Check for explicit topic shift signals
+            if i in patterns["topic_shifts"]:
+                boundaries.append(i)
+                print(f"Explicit topic shift detected at message {i}")
+                continue
+            
             # Compare current window with previous window
             current_similarities = []
             
@@ -162,7 +177,9 @@ class TopicBoundaryDetector:
         # Look for continuation signals
         continuation_keywords = [
             "also", "additionally", "furthermore", "moreover",
-            "building on that", "related to that", "similarly"
+            "building on that", "related to that", "similarly",
+            "back to", "returning to", "about that", "continuing with",
+            "going back to", "as for", "regarding"
         ]
         
         for i, msg in enumerate(messages):
