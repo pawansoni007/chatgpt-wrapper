@@ -17,6 +17,7 @@ sys.path.append(parent_dir)
 
 from conversation_memory import EnhancedConversationManager
 from thread_detection_system import ThreadAwareConversationManager
+from intent_classification_system import EnhancedIntentClassifier
 from models.chat_models import ChatRequest, ChatResponse, ConversationSummary
 
 import redis
@@ -28,7 +29,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Chat Wrapper API with Thread Detection", version="2.0.0 - Phase 3B")
+app = FastAPI(title="Chat Wrapper API with Intent Classification", version="2.1.0 - Phase 3C")
 
 #region Add CORS middleware
 app.add_middleware(
@@ -429,26 +430,42 @@ thread_aware_manager = ThreadAwareConversationManager(
     redis_client
 )
 
+# Initialize Intent Classification System
+intent_classifier = EnhancedIntentClassifier(cerebras_client)
+
 
 #region Routes
 @app.get("/")
 async def root():
     """Health check endpoint"""
     return {
-        "message": "Chat Wrapper API with Thread Detection is running!",
-        "version": "2.0.0 - Phase 3B",
-        "features": ["Thread Detection", "Topic Lifecycle", "Context Selection"],
+        "message": "Chat Wrapper API with Intent Classification is running!",
+        "version": "2.1.0 - Phase 3C",
+        "features": ["Intent Classification", "Thread Detection", "Topic Lifecycle", "Context Selection"],
+        "intent_categories": intent_classifier.get_intent_statistics()["categories"],
         "redis_connected": redis_client.ping()
     }
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
-    """Enhanced chat endpoint with thread-aware conversation management"""
+    """Enhanced chat endpoint with intent-aware conversation management"""
     
     conv_id = request.conversation_id or conv_manager.generate_conversation_id()
     
     try:
+        # NEW: Classify user intent first
+        recent_context = conv_manager.get_conversation(conv_id)[-4:]  # Last 4 messages for context
+        intent_result = intent_classifier.classify_intent(request.message, recent_context)
+        
+        # Log intent classification results
+        print(f"🎯 Intent: {intent_result.intent.value} (confidence: {intent_result.confidence:.2f})")
+        print(f"📝 Reasoning: {intent_result.reasoning}")
+        
+        if intent_result.requires_clarification:
+            print(f"⚠️  Clarification needed: {intent_result.clarification_reason}")
+        
         # Use thread-aware context preparation (Phase 3B)
+        # TODO: Enhance this with intent-specific context strategies in next phase
         context, estimated_tokens = thread_aware_manager.prepare_context_with_threads(conv_id, request.message)
         
         print(f"🧵 Thread-aware context prepared: {len(context)} messages, {estimated_tokens} tokens")
@@ -649,6 +666,35 @@ async def debug_thread_detection(conversation_id: str):
         }
         
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/debug/intent")
+async def debug_intent_classification(request: ChatRequest):
+    """Debug endpoint to test intent classification"""
+    try:
+        # Get recent context if conversation exists
+        recent_context = []
+        if request.conversation_id:
+            conversation = conv_manager.get_conversation(request.conversation_id)
+            recent_context = conversation[-4:] if conversation else []
+        
+        # Classify intent
+        intent_result = intent_classifier.classify_intent(request.message, recent_context)
+        
+        return {
+            "message": request.message,
+            "conversation_id": request.conversation_id,
+            "intent": intent_result.intent.value,
+            "confidence": intent_result.confidence,
+            "reasoning": intent_result.reasoning,
+            "secondary_intent": intent_result.secondary_intent.value if intent_result.secondary_intent else None,
+            "requires_clarification": intent_result.requires_clarification,
+            "clarification_reason": intent_result.clarification_reason,
+            "context_messages_used": len(recent_context)
+        }
+        
+    except Exception as e:
+        print(f"Intent classification debug error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 #endregion Routes
