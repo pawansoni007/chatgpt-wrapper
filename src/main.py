@@ -18,6 +18,7 @@ sys.path.append(parent_dir)
 from conversation_memory import EnhancedConversationManager
 from thread_detection_system import ThreadAwareConversationManager
 from intent_classification_system import EnhancedIntentClassifier
+from multilayered_context_builder import MultiLayeredContextBuilder
 from models.chat_models import ChatRequest, ChatResponse, ConversationSummary
 
 import redis
@@ -29,7 +30,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="Chat Wrapper API with Intent Classification", version="2.1.0 - Phase 3C")
+app = FastAPI(title="Chat Wrapper API with Intent Classification", version="2.2.0 - Phase 2+3C")
 
 #region Add CORS middleware
 app.add_middleware(
@@ -433,6 +434,13 @@ thread_aware_manager = ThreadAwareConversationManager(
 # Initialize Intent Classification System
 intent_classifier = EnhancedIntentClassifier(cerebras_client)
 
+# Initialize Phase 2 MultiLayered Context Builder
+multilayer_context_builder = MultiLayeredContextBuilder(
+    base_conv_manager=conv_manager,
+    thread_aware_manager=thread_aware_manager,
+    memory_manager=None  # Will add memory integration later
+)
+
 
 #region Routes
 @app.get("/")
@@ -440,9 +448,10 @@ async def root():
     """Health check endpoint"""
     return {
         "message": "Chat Wrapper API with Intent Classification is running!",
-        "version": "2.1.0 - Phase 3C",
-        "features": ["Intent Classification", "Thread Detection", "Topic Lifecycle", "Context Selection"],
+        "version": "2.2.0 - Phase 2+3C",
+        "features": ["Intent Classification", "Multilayered Context Building", "Thread Detection", "Topic Lifecycle", "Context Selection"],
         "intent_categories": intent_classifier.get_intent_statistics()["categories"],
+        "context_statistics": multilayer_context_builder.get_context_statistics(),
         "redis_connected": redis_client.ping()
     }
 
@@ -464,11 +473,13 @@ async def chat(request: ChatRequest):
         if intent_result.requires_clarification:
             print(f"⚠️  Clarification needed: {intent_result.clarification_reason}")
         
-        # Use thread-aware context preparation (Phase 3B)
-        # TODO: Enhance this with intent-specific context strategies in next phase
-        context, estimated_tokens = thread_aware_manager.prepare_context_with_threads(conv_id, request.message)
+        # Phase 2: Multilayered Context Building with Intent Awareness
+        context_result = multilayer_context_builder.build_context(intent_result, conv_id, request.message)
+        context = context_result.context
+        estimated_tokens = context_result.tokens_used
         
-        print(f"🧵 Thread-aware context prepared: {len(context)} messages, {estimated_tokens} tokens")
+        print(f"🧵 Context built: Level {context_result.level_used}, Strategy: {context_result.strategy}")
+        print(f"📊 Context: {len(context)} messages, {estimated_tokens} tokens")
         
         # Get response from Cerebras
         response_content, actual_tokens = await conv_manager.get_cerebras_response(context)
@@ -666,6 +677,49 @@ async def debug_thread_detection(conversation_id: str):
         }
         
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/debug/multilayer-context")
+async def debug_multilayer_context(request: ChatRequest):
+    """Debug endpoint to test multilayered context building"""
+    try:
+        conv_id = request.conversation_id or "debug_conversation"
+        
+        # Step 1: Classify intent
+        recent_context = conv_manager.get_conversation(conv_id)[-4:] if request.conversation_id else []
+        intent_result = intent_classifier.classify_intent(request.message, recent_context)
+        
+        # Step 2: Build multilayered context
+        context_result = multilayer_context_builder.build_context(intent_result, conv_id, request.message)
+        
+        return {
+            "message": request.message,
+            "conversation_id": conv_id,
+            "intent_classification": {
+                "intent": intent_result.intent.value,
+                "confidence": intent_result.confidence,
+                "reasoning": intent_result.reasoning,
+                "requires_clarification": intent_result.requires_clarification,
+                "clarification_reason": intent_result.clarification_reason
+            },
+            "context_building": {
+                "level_used": context_result.level_used,
+                "strategy": context_result.strategy,
+                "tokens_used": context_result.tokens_used,
+                "context_messages": len(context_result.context),
+                "debug_info": context_result.debug_info
+            },
+            "context_preview": [
+                {
+                    "role": msg.get("role", "unknown"),
+                    "content_preview": msg.get("content", "")[:100] + "..." if len(msg.get("content", "")) > 100 else msg.get("content", "")
+                }
+                for msg in context_result.context[:5]  # First 5 messages preview
+            ]
+        }
+        
+    except Exception as e:
+        print(f"Multilayer context debug error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/debug/intent")
