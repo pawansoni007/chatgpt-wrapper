@@ -483,7 +483,7 @@ async def chat(request: ChatRequest):
         intent_start_time = time.time() 
         print("1 Classifying intent with minimal context...") 
         recent_context = conv_manager.get_conversation(conv_id)[-6:] # Use last 6 messages 
-        intent_result = intent_classifier.classify_intent(request.message, recent_context) 
+        intent_result = intent_classifier.classify_intent(request.message, recent_context, conv_id) 
         intent_duration = time.time() - intent_start_time 
         
         print(f"   Intent: {intent_result.intent.value} (confidence: {intent_result.confidence:.2f})") 
@@ -736,7 +736,7 @@ async def debug_multilayer_context(request: ChatRequest):
         
         # Step 1: Classify intent
         recent_context = conv_manager.get_conversation(conv_id)[-4:] if request.conversation_id else []
-        intent_result = intent_classifier.classify_intent(request.message, recent_context)
+        intent_result = intent_classifier.classify_intent(request.message, recent_context, conv_id)
         
         # Step 2: Build multilayered context
         context_result = smart_context_selector.get_comprehensive_context(request.message, conv_id, intent_result)
@@ -782,7 +782,7 @@ async def debug_intent_classification(request: ChatRequest):
             recent_context = conversation[-4:] if conversation else []
         
         # Classify intent
-        intent_result = intent_classifier.classify_intent(request.message, recent_context)
+        intent_result = intent_classifier.classify_intent(request.message, recent_context, conv_id)
         
         return {
             "message": request.message,

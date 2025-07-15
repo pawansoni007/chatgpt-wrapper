@@ -1,4 +1,5 @@
 import json
+import hashlib
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from enum import Enum
@@ -36,17 +37,26 @@ class IntentClassification:
 
 class EnhancedIntentClassifier:
     """
-    Intent classification system using Cerebras LLM with function calling.
-    Classifies user messages into 11 intent categories for better response routing.
+    IMPROVED Intent classification system with stability enhancements:
+    - Uses Qwen-3-32B for more consistent results
+    - Lower temperature for deterministic behavior
+    - Intent caching for similar messages
+    - Intent smoothing to prevent oscillation
     """
     
     def __init__(self, cerebras_client):
         self.cerebras_client = cerebras_client
         
-        # Configuration
-        self.confidence_threshold = 0.7  # Threshold for high-confidence classification
-        self.clarification_threshold = 0.5  # Below this, ask for clarification
-        self.max_context_messages = 4  # Recent messages to use for context
+        # IMPROVED Configuration for stability
+        self.confidence_threshold = 0.7
+        self.clarification_threshold = 0.5
+        self.max_context_messages = 4
+        
+        # NEW: Stability features
+        self.intent_cache = {}  # Cache for similar messages
+        self.conversation_intent_history = {}  # Track intent patterns per conversation
+        self.cache_similarity_threshold = 0.85  # High similarity = use cached intent
+        self.smoothing_window = 3  # Consider last 3 intents for smoothing
         
         # Intent patterns for quick detection
         self.intent_patterns = self._build_intent_patterns()
@@ -186,13 +196,14 @@ class EnhancedIntentClassifier:
 
         Your entire response must be valid JSON only."""
 
-    def classify_intent(self, user_message: str, recent_context: List[Dict] = None) -> IntentClassification:
+    def classify_intent(self, user_message: str, recent_context: List[Dict] = None, conv_id: str = None) -> IntentClassification:
         """
-        Classify the intent of a user message
+        IMPROVED Classify the intent of a user message with stability enhancements
         
         Args:
             user_message: The user's current message
             recent_context: List of recent conversation messages for context
+            conv_id: Conversation ID for intent smoothing
             
         Returns:
             IntentClassification object with intent, confidence, and reasoning
@@ -207,15 +218,21 @@ class EnhancedIntentClassifier:
         
         recent_context = recent_context or []
         
+        # NEW: Check cache for similar messages first
+        cached_intent = self._check_intent_cache(user_message)
+        if cached_intent:
+            print(f"🎯 Using cached intent: {cached_intent.intent.value}")
+            return cached_intent
+        
         try:
             # Build classification prompt
             prompt = self._build_classification_prompt(user_message, recent_context)
             
-            # Get classification from Cerebras (synchronous call like in main.py)
+            # IMPROVED: Use Qwen-3-32B with lower temperature for consistency
             response = self.cerebras_client.chat.completions.create(
-                model="llama-3.3-70b",
+                model="qwen-3-32b",  # Changed from llama-3.3-70b for better consistency
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,  # Lower temperature for more consistent classification
+                temperature=0.1,  # MUCH lower temperature for deterministic results
                 max_tokens=300
             )
             
@@ -224,7 +241,19 @@ class EnhancedIntentClassifier:
             # Parse JSON response
             try:
                 classification_data = json.loads(response_text)
-                return self._parse_classification_response(classification_data, user_message)
+                raw_intent = self._parse_classification_response(classification_data, user_message)
+                
+                # NEW: Apply intent smoothing based on conversation history
+                smoothed_intent = self._apply_intent_smoothing(raw_intent, conv_id) if conv_id else raw_intent
+                
+                # NEW: Cache the result
+                self._cache_intent(user_message, smoothed_intent)
+                
+                # NEW: Update conversation history
+                if conv_id:
+                    self._update_conversation_intent_history(conv_id, smoothed_intent)
+                
+                return smoothed_intent
                 
             except json.JSONDecodeError as e:
                 print(f"❌ Failed to parse classification JSON: {e}")
@@ -234,6 +263,99 @@ class EnhancedIntentClassifier:
         except Exception as e:
             print(f"❌ Error in intent classification: {e}")
             return self._fallback_classification(user_message, recent_context)
+    
+    def _check_intent_cache(self, user_message: str) -> Optional[IntentClassification]:
+        """NEW: Check if we have a cached intent for similar message"""
+        message_hash = self._hash_message(user_message)
+        
+        # Check for exact match first
+        if message_hash in self.intent_cache:
+            return self.intent_cache[message_hash]['intent']
+        
+        # Check for similar messages (simplified similarity check)
+        for cached_hash, cached_data in self.intent_cache.items():
+            cached_message = cached_data['message']
+            if self._simple_similarity(user_message, cached_message) > self.cache_similarity_threshold:
+                print(f"🔄 Found similar cached message")
+                return cached_data['intent']
+        
+        return None
+    
+    def _apply_intent_smoothing(self, current_intent: IntentClassification, conv_id: str) -> IntentClassification:
+        """NEW: Apply smoothing based on recent intent history"""
+        if not conv_id:
+            return current_intent
+            
+        history = self.conversation_intent_history.get(conv_id, [])
+        
+        if len(history) < 2:
+            return current_intent  # Not enough history for smoothing
+        
+        # Check if current intent is dramatically different from recent pattern
+        recent_intents = [h.intent for h in history[-self.smoothing_window:]]
+        most_common_recent = max(set(recent_intents), key=recent_intents.count)
+        
+        # If confidence is low and recent pattern is strong, bias toward recent pattern
+        if (current_intent.confidence < 0.7 and 
+            recent_intents.count(most_common_recent) >= 2 and
+            current_intent.intent != most_common_recent):
+            
+            print(f"🔄 Intent smoothing: {current_intent.intent.value} → {most_common_recent.value}")
+            
+            # Create smoothed intent with adjusted confidence
+            return IntentClassification(
+                intent=most_common_recent,
+                confidence=0.7,  # Moderate confidence for smoothed intent
+                reasoning=f"Smoothed from {current_intent.intent.value} based on recent pattern",
+                secondary_intent=current_intent.intent
+            )
+        
+        return current_intent
+    
+    def _cache_intent(self, user_message: str, intent: IntentClassification):
+        """NEW: Cache the intent result"""
+        message_hash = self._hash_message(user_message)
+        self.intent_cache[message_hash] = {
+            'message': user_message,
+            'intent': intent,
+            'timestamp': datetime.now()
+        }
+        
+        # Keep cache size reasonable
+        if len(self.intent_cache) > 100:
+            # Remove oldest entries
+            oldest_items = sorted(self.intent_cache.items(), key=lambda x: x[1]['timestamp'])
+            for old_hash, _ in oldest_items[:20]:
+                del self.intent_cache[old_hash]
+    
+    def _update_conversation_intent_history(self, conv_id: str, intent: IntentClassification):
+        """NEW: Update conversation intent history"""
+        if conv_id not in self.conversation_intent_history:
+            self.conversation_intent_history[conv_id] = []
+        
+        self.conversation_intent_history[conv_id].append(intent)
+        
+        # Keep history size reasonable
+        if len(self.conversation_intent_history[conv_id]) > 20:
+            self.conversation_intent_history[conv_id] = self.conversation_intent_history[conv_id][-15:]
+    
+    def _hash_message(self, message: str) -> str:
+        """NEW: Create hash for message caching"""
+        normalized = message.lower().strip()
+        return hashlib.md5(normalized.encode()).hexdigest()
+    
+    def _simple_similarity(self, msg1: str, msg2: str) -> float:
+        """NEW: Simple similarity check for caching"""
+        words1 = set(msg1.lower().split())
+        words2 = set(msg2.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = len(words1.intersection(words2))
+        union = len(words1.union(words2))
+        
+        return intersection / union if union > 0 else 0.0
     
     def _parse_classification_response(self, data: Dict, user_message: str) -> IntentClassification:
         """Parse the LLM's classification response into IntentClassification object"""
@@ -337,7 +459,15 @@ class EnhancedIntentClassifier:
             "config": {
                 "confidence_threshold": self.confidence_threshold,
                 "clarification_threshold": self.clarification_threshold,
-                "max_context_messages": self.max_context_messages
+                "max_context_messages": self.max_context_messages,
+                "cache_size": len(self.intent_cache),
+                "conversations_tracked": len(self.conversation_intent_history)
+            },
+            "stability_features": {
+                "intent_caching": "enabled",
+                "intent_smoothing": "enabled", 
+                "model": "qwen-3-32b",
+                "temperature": 0.1
             }
         }
 
@@ -361,11 +491,11 @@ def test_intent_classifier(cerebras_client):
         "Please always format code in markdown"
     ]
     
-    print("🧪 Testing Intent Classification System")
+    print("🧪 Testing IMPROVED Intent Classification System")
     print("=" * 50)
     
     for i, message in enumerate(test_cases, 1):
-        result = classifier.classify_intent(message)
+        result = classifier.classify_intent(message, conv_id="test_conversation")
         
         print(f"\n{i}. Message: \"{message}\"")
         print(f"   Intent: {result.intent.value}")
@@ -379,11 +509,12 @@ def test_intent_classifier(cerebras_client):
             print(f"   ⚠️  Needs clarification: {result.clarification_reason}")
     
     print("\n" + "=" * 50)
-    print("✅ Intent classification testing complete!")
+    print("✅ IMPROVED Intent classification testing complete!")
+    print(f"📊 Final stats: {classifier.get_intent_statistics()}")
 
 if __name__ == "__main__":
     # This allows testing the classifier independently
-    print("Intent Classification System - Standalone Test Mode")
+    print("IMPROVED Intent Classification System - Standalone Test Mode")
     print("Note: This requires CEREBRAS_API_KEY environment variable")
     
     import os
