@@ -1,5 +1,5 @@
 """
-SIMPLIFIED Thread Detection System
+SIMPLIFIED Thread Detection System with Azure OpenAI
 
 Removed complexity:
 - No thread lifecycle management (active/dormant/completed)
@@ -7,10 +7,7 @@ Removed complexity:
 - No complex boundary detection
 - No semantic anchors and confidence scores
 
-Kept essentials:
-- Basic topic clustering for related messages
-- Simple context preparation 
-- Integration with existing API structure
+Uses Azure OpenAI for embeddings instead of Cohere.
 """
 
 import json
@@ -59,10 +56,10 @@ class ConversationThread:
         )
 
 class SimplifiedTopicDetector:
-    """SIMPLIFIED topic detection - just basic clustering"""
+    """SIMPLIFIED topic detection using Azure OpenAI embeddings"""
     
-    def __init__(self, cohere_client):
-        self.cohere_client = cohere_client
+    def __init__(self, azure_client):
+        self.azure_client = azure_client  # Use Azure OpenAI instead of Cohere
         self.cluster_size = 8  # Messages per cluster/thread
         
     def create_simple_threads(self, messages: List[Dict]) -> List[ConversationThread]:
@@ -247,7 +244,7 @@ class SimplifiedThreadContextSelector:
 
 class ThreadAwareConversationManager:
     """
-    SIMPLIFIED Thread-aware conversation manager
+    SIMPLIFIED Thread-aware conversation manager using Azure OpenAI
     
     Removed complexity:
     - No thread reactivation
@@ -255,18 +252,15 @@ class ThreadAwareConversationManager:
     - No thread lifecycle transitions
     - No semantic anchors
     
-    Kept essentials:
-    - Basic thread grouping
-    - Simple context preparation
-    - API compatibility
+    Uses Azure OpenAI for embeddings instead of Cohere.
     """
     
-    def __init__(self, base_manager, cohere_client, redis_client):
+    def __init__(self, base_manager, azure_client, redis_client):
         self.base_manager = base_manager
-        self.cohere_client = cohere_client
+        self.azure_client = azure_client  # Use Azure OpenAI instead of Cohere
         
-        # SIMPLIFIED components
-        self.boundary_detector = SimplifiedTopicDetector(cohere_client)
+        # SIMPLIFIED components using Azure OpenAI
+        self.boundary_detector = SimplifiedTopicDetector(azure_client)
         self.lifecycle_manager = SimplifiedThreadLifecycleManager(redis_client)
         self.context_selector = SimplifiedThreadContextSelector(base_manager)
     
@@ -278,7 +272,7 @@ class ThreadAwareConversationManager:
         
         # Simple thread update: just mark that we have new messages
         # No complex analysis or reactivation needed
-        print(f"✅ Added exchange for conversation {conv_id}")
+        print(f"✅ Added exchange for conversation {conv_id} (Azure OpenAI)")
         
         return True
     
@@ -292,7 +286,7 @@ class ThreadAwareConversationManager:
         
         threads = self.boundary_detector.create_simple_threads(conversation)
         
-        print(f"📊 Created {len(threads)} simple threads for conversation {conv_id}")
+        print(f"📊 Created {len(threads)} simple threads for conversation {conv_id} (Azure OpenAI)")
         
         return threads
     
@@ -310,10 +304,10 @@ class ThreadAwareConversationManager:
         # Select context using simplified logic
         context = self.context_selector.select_thread_context(conv_id, threads, user_message)
         
-        # Calculate token usage
-        total_tokens = sum(self.base_manager.count_tokens(msg.get("content", "")) for msg in context)
+        # Calculate token usage using Azure OpenAI tokenizer
+        total_tokens = sum(self.azure_client.count_tokens(msg.get("content", "")) for msg in context)
         
-        print(f"🔍 Thread context: {len(context)} messages, {total_tokens} tokens")
+        print(f"🔍 Thread context: {len(context)} messages, {total_tokens} tokens (Azure OpenAI)")
         
         return context, total_tokens
     

@@ -1,7 +1,8 @@
 """
-SmartContextSelector - Simplified Single-Pass Context Search
+SmartContextSelector - Azure OpenAI Powered Context Search
 
-SIMPLIFIED VERSION with stability improvements:
+SIMPLIFIED VERSION with Azure OpenAI:
+- Uses Azure OpenAI embeddings instead of Cohere
 - Only 2 strategies: SEMANTIC_HYBRID vs RECENT_FALLBACK
 - Removed complex memory and thread management
 - Simple, predictable strategy selection
@@ -34,9 +35,10 @@ class ContextSelectionStrategy(Enum):
 
 class SmartContextSelector:
     """
-    SIMPLIFIED Single-pass context selector:
+    SIMPLIFIED Azure OpenAI powered context selector:
     - Only 2 strategies for predictable behavior
     - Simple decision rules
+    - Uses Azure OpenAI embeddings
     - Better performance and easier debugging
     """
     
@@ -45,18 +47,19 @@ class SmartContextSelector:
         Initialize the SmartContextSelector
         
         Args:
-            cohere_client: Cohere client for semantic embeddings
+            cohere_client: Azure OpenAI client (parameter name kept for compatibility)
             conversation_manager: Base conversation manager
             thread_manager: Optional thread detection system
             memory_manager: Optional (deprecated, not used)
         """
-        self.cohere_client = cohere_client
+        # Note: parameter is named cohere_client for backward compatibility, but it's actually Azure OpenAI
+        self.azure_client = cohere_client  # This is actually the Azure OpenAI client now
         self.conv_manager = conversation_manager
         self.thread_manager = thread_manager
         # memory_manager is deprecated and ignored
         
         # Context selection configuration
-        self.max_tokens = getattr(conversation_manager, 'max_tokens', 60000)
+        self.max_tokens = getattr(conversation_manager, 'max_tokens', 120000)  # Azure OpenAI supports more
         self.reserved_tokens = getattr(conversation_manager, 'reserved_tokens', 4000)
         self.available_tokens = self.max_tokens - self.reserved_tokens
         
@@ -82,7 +85,7 @@ class SmartContextSelector:
             ComprehensiveContextResult with optimal context
         """
         
-        print(f"🔍 SmartContextSelector: Building context for conv {conv_id}")
+        print(f"🔍 SmartContextSelector: Building context for conv {conv_id} (Azure OpenAI)")
         
         # Get conversation length
         conversation = self.conv_manager.get_conversation(conv_id)
@@ -106,8 +109,8 @@ class SmartContextSelector:
         SIMPLIFIED strategy selection with just 2 clear rules:
         
         Rule 1: Short conversations always use RECENT_FALLBACK (fast)
-        Rule 2: High-confidence continuations use RECENT_FALLBACK (fast)  
-        Rule 3: Everything else uses SEMANTIC_HYBRID (comprehensive)
+        Rule 2: High-confidence continuations in medium conversations use RECENT_FALLBACK (fast)  
+        Rule 3: Long conversations OR complex intents use SEMANTIC_HYBRID (comprehensive)
         """
         
         print(f"🧐 Strategy selection. Intent: {intent_info.intent.value}, Confidence: {intent_info.confidence:.2f}")
@@ -118,6 +121,7 @@ class SmartContextSelector:
             return ContextSelectionStrategy.RECENT_FALLBACK
 
         # Rule 2: High-confidence simple continuations use recent context (fast path)
+        # BUT only for medium-length conversations - long ones need semantic search
         fast_path_intents = [
             IntentCategory.CONTINUATION, 
             IntentCategory.REFINEMENT, 
@@ -139,7 +143,7 @@ class SmartContextSelector:
         """
         IMPROVED semantic hybrid selection that delegates to thread manager if available
         """
-        print("🎨 Using comprehensive semantic+thread context selection.")
+        print("🎨 Using comprehensive semantic+thread context selection (Azure OpenAI).")
         
         if not self.thread_manager:
             print("⚠️ Thread manager not available. Using recent context with semantic boost.")
@@ -158,11 +162,11 @@ class SmartContextSelector:
                 context=context,
                 tokens_used=tokens,
                 relevant_threads=relevant_thread_ids,
-                memory_factors=["Thread-aware context selection"],
+                memory_factors=["Azure OpenAI thread-aware context selection"],
                 semantic_scores=[],
                 selection_strategy=ContextSelectionStrategy.SEMANTIC_HYBRID.value,
                 debug_info={
-                    "method": "Thread-aware delegation",
+                    "method": "Azure OpenAI Thread-aware delegation",
                     "total_threads": len(threads),
                     "active_threads": len(active_threads),
                     "context_messages": len(context)
@@ -216,11 +220,11 @@ class SmartContextSelector:
             context=context,
             tokens_used=total_tokens,
             relevant_threads=[],
-            memory_factors=[f"Recent {len(selected_messages)} messages"],
+            memory_factors=[f"Recent {len(selected_messages)} messages (Azure OpenAI)"],
             semantic_scores=[],
             selection_strategy=ContextSelectionStrategy.RECENT_FALLBACK.value,
             debug_info={
-                "method": "Recent messages with token management",
+                "method": "Recent messages with token management (Azure OpenAI)",
                 "messages_requested": len(recent_messages),
                 "messages_used": len(selected_messages),
                 "tokens_available": available_for_history,
@@ -229,8 +233,10 @@ class SmartContextSelector:
         )
      
     def _count_tokens(self, text: str) -> int:
-        """Count tokens using the conversation manager's method"""
-        if hasattr(self.conv_manager, 'count_tokens'):
+        """Count tokens using Azure OpenAI tokenizer"""
+        if hasattr(self.azure_client, 'count_tokens'):
+            return self.azure_client.count_tokens(text)
+        elif hasattr(self.conv_manager, 'count_tokens'):
             return self.conv_manager.count_tokens(text)
         else:
             # Fallback approximation
@@ -253,15 +259,16 @@ class SmartContextSelector:
             },
             "strategy_selection": {
                 "short_conversations": f"< {self.min_length_for_semantic} messages → RECENT_FALLBACK",
-                "high_confidence_continuations": "confidence > 0.7 → RECENT_FALLBACK",
-                "complex_intents": "everything else → SEMANTIC_HYBRID"
+                "medium_high_confidence_continuations": "confidence > 0.7 & < 30 msgs → RECENT_FALLBACK",
+                "long_conversations_or_complex": "30+ messages OR complex intents → SEMANTIC_HYBRID"
             },
             "components_available": {
-                "cohere_client": self.cohere_client is not None,
+                "azure_openai_client": self.azure_client is not None,
                 "conversation_manager": self.conv_manager is not None,
                 "thread_manager": self.thread_manager is not None
             },
             "improvements": {
+                "embeddings_provider": "Azure OpenAI (replaced Cohere)",
                 "strategies_simplified": "4 → 2 strategies",
                 "memory_system_removed": "Not implemented, removed complexity",
                 "predictable_selection": "Simple rules, no oscillation",
@@ -270,11 +277,7 @@ class SmartContextSelector:
         }
 
     # REMOVED: All memory-guided methods (they weren't working anyway)
-    # - _memory_guided_selection()
-    # - _filter_by_memory_topics()
-    # - Memory-related helper methods
-    
     # REMOVED: Complex thread-focused strategy (merged into semantic_hybrid)
     # REMOVED: Multiple similarity calculations and complex scoring
     
-    # The goal is SIMPLICITY and PREDICTABILITY over complex features that don't work well
+    # The goal is SIMPLICITY and PREDICTABILITY with Azure OpenAI power
