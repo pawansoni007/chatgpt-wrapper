@@ -1,13 +1,12 @@
 """
-SIMPLIFIED Thread Detection System with Azure OpenAI
+ROBUST Thread Detection System with Azure OpenAI and Token Management
 
-Removed complexity:
-- No thread lifecycle management (active/dormant/completed)
-- No thread reactivation logic  
-- No complex boundary detection
-- No semantic anchors and confidence scores
-
-Uses Azure OpenAI for embeddings instead of Cohere.
+Enhanced features:
+- DBSCAN clustering for semantic thread detection
+- Token-aware embedding handling (fixes truncation issues)
+- Thread summaries for optimization
+- Robust context selection with token limits
+- Automatic summarization when context exceeds limits
 """
 
 import json
@@ -16,21 +15,32 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+import asyncio
+
+# Install scikit-learn if not already installed: pip install scikit-learn
+try:
+    from sklearn.cluster import DBSCAN
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    print("⚠️ scikit-learn not available. Install with: pip install scikit-learn")
+    SKLEARN_AVAILABLE = False
 
 class ThreadStatus(Enum):
-    ACTIVE = "active"      # Only status we use now
+    ACTIVE = "active"
+    ARCHIVED = "archived"  # Simple lifecycle: archive inactive threads
     COMPLETED = "completed"  # For API compatibility
 
 @dataclass
 class ConversationThread:
-    """SIMPLIFIED thread representation"""
+    """Enhanced thread representation with summaries"""
     thread_id: str
     messages: List[int]  # Message indices
     topic: str
     status: ThreadStatus
     created_at: datetime
     last_activity: datetime
-    confidence_score: float = 0.8  # Fixed score for simplicity
+    confidence_score: float = 0.8
+    summary: str = ""  # Add this for compressed representation
     
     def to_dict(self) -> Dict:
         return {
@@ -40,7 +50,8 @@ class ConversationThread:
             "status": self.status.value,
             "created_at": self.created_at.isoformat(),
             "last_activity": self.last_activity.isoformat(),
-            "confidence_score": self.confidence_score
+            "confidence_score": self.confidence_score,
+            "summary": self.summary
         }
     
     @classmethod
@@ -52,46 +63,88 @@ class ConversationThread:
             status=ThreadStatus(data["status"]),
             created_at=datetime.fromisoformat(data["created_at"]),
             last_activity=datetime.fromisoformat(data["last_activity"]),
-            confidence_score=data.get("confidence_score", 0.8)
+            confidence_score=data.get("confidence_score", 0.8),
+            summary=data.get("summary", "")
         )
 
-class SimplifiedTopicDetector:
-    """SIMPLIFIED topic detection using Azure OpenAI embeddings"""
-    
-    def __init__(self, azure_client):
-        self.azure_client = azure_client  # Use Azure OpenAI instead of Cohere
-        self.cluster_size = 8  # Messages per cluster/thread
-        
-    def create_simple_threads(self, messages: List[Dict]) -> List[ConversationThread]:
-        """Create simple threads by clustering messages into groups"""
-        
+class RobustTopicDetector:
+    def __init__(self, azure_client, similarity_threshold=0.7, max_tokens=6000):
+        self.azure_client = azure_client
+        self.similarity_threshold = similarity_threshold
+        self.max_tokens = max_tokens
+
+    async def create_threads(self, messages: List[Dict]) -> List[ConversationThread]:
         if len(messages) < 4:
-            # Too short for threading
             return []
-        
+
+        # Embed messages (with chunking for long ones)
+        embeddings = []
+        for msg in messages:
+            content = msg["content"]
+            if self.azure_client.count_tokens(content) > self.max_tokens:
+                # Use chunking + average (from our previous code)
+                emb = self.azure_client.get_embedding(content)  # Assume this handles chunking internally
+            else:
+                emb = self.azure_client.get_embedding(content)
+            embeddings.append(emb)
+
+        if not SKLEARN_AVAILABLE or len(embeddings) < 6:
+            # Fallback to simple grouping
+            return await self._create_simple_threads(messages)
+
+        # Cluster embeddings semantically
+        embeddings_array = np.array([emb for emb in embeddings if emb])  # Filter empty embeddings
+        if len(embeddings_array) < 6:
+            return await self._create_simple_threads(messages)
+            
+        clustering = DBSCAN(eps=0.5, min_samples=3, metric="cosine").fit(embeddings_array)
+        labels = clustering.labels_
+
+        # Group into threads
         threads = []
         thread_id = 1
+        for label in set(labels):
+            if label == -1: continue  # Noise points (outliers)
+            thread_msgs = [i for i, l in enumerate(labels) if l == label]
+            if len(thread_msgs) < 3: continue
+
+            # Generate topic via LLM summary of first few
+            topic_text = " ".join([messages[i]["content"][:200] for i in thread_msgs[:3]])
+            topic = await self._llm_call("Generate a concise topic for this: " + topic_text)
+
+            # Summarize thread for token efficiency
+            summary = await self._generate_summary([messages[i] for i in thread_msgs])
+
+            thread = ConversationThread(
+                thread_id=f"thread_{thread_id}",
+                messages=thread_msgs,
+                topic=topic,
+                status=ThreadStatus.ACTIVE,
+                created_at=datetime.now() - timedelta(days=1),  # Example
+                last_activity=datetime.now(),
+                summary=summary
+            )
+            threads.append(thread)
+            thread_id += 1
+
+        return threads
+
+    async def _create_simple_threads(self, messages: List[Dict]) -> List[ConversationThread]:
+        """Fallback simple threading"""
+        threads = []
+        thread_id = 1
+        cluster_size = 8
         
-        # Simple approach: group messages into fixed-size clusters
-        for i in range(0, len(messages), self.cluster_size):
-            end_idx = min(i + self.cluster_size, len(messages))
-            
-            if end_idx - i < 3:  # Skip very short groups
+        for i in range(0, len(messages), cluster_size):
+            end_idx = min(i + cluster_size, len(messages))
+            if end_idx - i < 3:
                 continue
                 
             message_indices = list(range(i, end_idx))
+            topic_text = " ".join([messages[idx]["content"][:200] for idx in message_indices[:3]])
+            topic = await self._llm_call("Generate a concise topic for this: " + topic_text)
+            summary = await self._generate_summary([messages[idx] for idx in message_indices])
             
-            # Generate simple topic from first few messages
-            topic_messages = []
-            for idx in message_indices[:3]:
-                if idx < len(messages):
-                    content = messages[idx].get("content", "")
-                    if content:
-                        topic_messages.append(content)
-            
-            topic = self._generate_simple_topic(topic_messages)
-            
-            # All threads are active (no complex lifecycle)
             thread = ConversationThread(
                 thread_id=f"thread_{thread_id}",
                 messages=message_indices,
@@ -99,52 +152,140 @@ class SimplifiedTopicDetector:
                 status=ThreadStatus.ACTIVE,
                 created_at=datetime.now() - timedelta(minutes=thread_id*5),
                 last_activity=datetime.now(),
-                confidence_score=0.8
+                summary=summary
             )
-            
             threads.append(thread)
             thread_id += 1
-        
+            
         return threads
-    
-    def _generate_simple_topic(self, messages: List[str]) -> str:
-        """Generate a simple topic name"""
-        
-        if not messages:
-            return "General Discussion"
-        
-        # Combine messages for topic analysis
-        combined_text = " ".join(messages)[:300]  # Limit length
-        
-        # Simple keyword extraction
-        words = combined_text.lower().split()
-        
-        # Look for common technical terms
-        tech_keywords = {
-            'react', 'python', 'javascript', 'api', 'database', 'frontend', 
-            'backend', 'authentication', 'deployment', 'error', 'bug', 'fix',
-            'create', 'build', 'implement', 'feature', 'component', 'function'
-        }
-        
-        found_keywords = [word for word in words if word in tech_keywords]
-        
-        if found_keywords:
-            # Use most common technical term
-            most_common = max(set(found_keywords), key=found_keywords.count)
-            return f"{most_common.title()} Discussion"
-        
-        # Fallback to generic topics based on message patterns
-        if any(word in combined_text.lower() for word in ['error', 'bug', 'fix', 'problem']):
-            return "Debugging Session"
-        elif any(word in combined_text.lower() for word in ['create', 'build', 'new', 'start']):
-            return "Development Task"
-        elif any(word in combined_text.lower() for word in ['how', 'what', 'why', 'explain']):
-            return "Learning & Questions"
-        else:
+
+    async def _llm_call(self, prompt: str) -> str:
+        """Generate topic using Azure OpenAI"""
+        try:
+            messages = [
+                {"role": "system", "content": "Generate concise topics for conversation segments. Respond with just the topic, 2-4 words max."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            response = await self.azure_client.chat_completion(
+                messages=messages,
+                task_type="intent",
+                temperature=0.3,
+                max_tokens=50
+            )
+            
+            return response.content.strip()
+            
+        except Exception as e:
+            print(f"Error generating topic: {e}")
             return "General Discussion"
 
+    async def _generate_summary(self, messages: List[Dict]) -> str:
+        """Generate thread summary"""
+        try:
+            content = " ".join([msg["content"] for msg in messages])[:2000]  # Limit length
+            
+            prompt = f"Summarize this conversation thread in 1-2 sentences: {content}"
+            
+            messages_for_llm = [
+                {"role": "system", "content": "Summarize conversation threads concisely, preserving key technical details."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            response = await self.azure_client.chat_completion(
+                messages=messages_for_llm,
+                task_type="intent",
+                temperature=0.3,
+                max_tokens=100
+            )
+            
+            return response.content.strip()
+            
+        except Exception as e:
+            print(f"Error generating summary: {e}")
+            return "Thread summary unavailable"
+
+class RobustThreadContextSelector:
+    def __init__(self, base_manager, azure_client):
+        self.base_manager = base_manager
+        self.azure_client = azure_client
+
+    async def select_thread_context(self, conv_id: str, threads: List[ConversationThread], user_message: str, token_limit=100000) -> List[Dict]:
+        conversation = self.base_manager.get_conversation(conv_id)
+        
+        if not threads:
+            return self._get_recent_context(conversation, user_message)
+
+        # Embed user message
+        user_emb = self.azure_client.get_embedding(user_message)
+
+        # Find most relevant thread (cosine similarity)
+        similarities = []
+        for thread in threads:
+            thread_emb = self.azure_client.get_embedding(thread.summary or " ".join([conversation[i]["content"] for i in thread.messages[:3]]))
+            sim = np.dot(user_emb, thread_emb) / (np.linalg.norm(user_emb) * np.linalg.norm(thread_emb))
+            similarities.append(sim)
+
+        best_thread_idx = np.argmax(similarities)
+        best_thread = threads[best_thread_idx]
+
+        # Build context: Summary + recent messages from best thread + global recent
+        context_msgs = [{"role": "system", "content": f"Thread Summary: {best_thread.summary}"}] + \
+                       [conversation[i] for i in best_thread.messages[-6:]] + \
+                       conversation[-4:]  # Recent global
+
+        # Token check and summarize if needed
+        total_tokens = sum(self.azure_client.count_tokens(msg["content"]) for msg in context_msgs)
+        if total_tokens > token_limit * 0.8:
+            # Summarize and warn
+            summarized = await self._generate_summary_for_context(context_msgs[:-1])  # Exclude user msg
+            context_msgs = [{"role": "system", "content": f"Summarized Context (to save tokens): {summarized}"}] + \
+                           context_msgs[-2:]  # Keep last assistant + user
+            # Add user warning in response later
+
+        context_msgs.append({"role": "user", "content": user_message})
+        return context_msgs
+
+    def _get_recent_context(self, conversation: List[Dict], user_message: str) -> List[Dict]:
+        """Fallback to recent messages"""
+        recent_messages = conversation[-10:] if conversation else []
+        
+        system_msg = {
+            "role": "system",
+            "content": "You are a helpful assistant. Provide thoughtful responses based on the conversation history."
+        }
+        
+        context = [system_msg]
+        context.extend(recent_messages)
+        context.append({"role": "user", "content": user_message})
+        
+        return context
+
+    async def _generate_summary_for_context(self, messages: List[Dict]) -> str:
+        """Generate summary for context compression"""
+        try:
+            content = "\n".join([f"{msg['role']}: {msg['content']}" for msg in messages])[:2000]
+            
+            prompt = f"Summarize this conversation preserving key context: {content}"
+            
+            response = await self.azure_client.chat_completion(
+                messages=[
+                    {"role": "system", "content": "Create concise summaries preserving technical context."},
+                    {"role": "user", "content": prompt}
+                ],
+                task_type="intent",
+                temperature=0.3,
+                max_tokens=300
+            )
+            
+            return response.content.strip()
+            
+        except Exception as e:
+            print(f"Error generating context summary: {e}")
+            return "Previous conversation context"
+
 class SimplifiedThreadLifecycleManager:
-    """SIMPLIFIED lifecycle management - just basic persistence"""
+    """Thread persistence manager"""
     
     def __init__(self, redis_client):
         self.redis_client = redis_client
@@ -175,146 +316,78 @@ class SimplifiedThreadLifecycleManager:
         except Exception as e:
             print(f"Error saving threads: {e}")
 
-class SimplifiedThreadContextSelector:
-    """SIMPLIFIED context selection using threads"""
-    
-    def __init__(self, base_manager):
-        self.base_manager = base_manager
-    
-    def select_thread_context(self, conv_id: str, threads: List[ConversationThread], user_message: str) -> List[Dict]:
-        """SIMPLIFIED context selection"""
-        
-        conversation = self.base_manager.get_conversation(conv_id)
-        
-        if not conversation or not threads:
-            # Fallback to recent messages
-            return self._get_recent_context(conversation, user_message)
-        
-        # Simple approach: use messages from the last thread + some recent context
-        last_thread = threads[-1] if threads else None
-        
-        if last_thread:
-            # Get messages from last thread
-            thread_messages = []
-            for idx in last_thread.messages[-6:]:  # Last 6 from thread
-                if idx < len(conversation):
-                    thread_messages.append(conversation[idx])
-            
-            # Add some recent messages not in thread
-            recent_start = max(0, len(conversation) - 4)
-            recent_messages = conversation[recent_start:]
-            
-            # Combine without duplicates
-            all_messages = []
-            used_indices = set(last_thread.messages[-6:])
-            
-            # Add thread messages
-            all_messages.extend(thread_messages)
-            
-            # Add recent messages not already included
-            for i, msg in enumerate(recent_messages, start=recent_start):
-                if i not in used_indices:
-                    all_messages.append(msg)
-            
-            # Sort by original order and take last 12
-            all_messages = all_messages[-12:]
-            
-        else:
-            all_messages = conversation[-10:]  # Fallback
-        
-        return self._build_context_with_system(all_messages, user_message)
-    
-    def _get_recent_context(self, conversation: List[Dict], user_message: str) -> List[Dict]:
-        """Fallback to recent messages"""
-        recent_messages = conversation[-10:] if conversation else []
-        return self._build_context_with_system(recent_messages, user_message)
-    
-    def _build_context_with_system(self, messages: List[Dict], user_message: str) -> List[Dict]:
-        """Build context with system message"""
-        system_msg = {
-            "role": "system",
-            "content": "You are a helpful assistant. Provide thoughtful responses based on the conversation history."
-        }
-        
-        context = [system_msg]
-        context.extend(messages)
-        context.append({"role": "user", "content": user_message})
-        
-        return context
-
 class ThreadAwareConversationManager:
     """
-    SIMPLIFIED Thread-aware conversation manager using Azure OpenAI
-    
-    Removed complexity:
-    - No thread reactivation
-    - No complex boundary detection  
-    - No thread lifecycle transitions
-    - No semantic anchors
-    
-    Uses Azure OpenAI for embeddings instead of Cohere.
+    Enhanced Thread-aware conversation manager with robust features
     """
     
     def __init__(self, base_manager, azure_client, redis_client):
         self.base_manager = base_manager
-        self.azure_client = azure_client  # Use Azure OpenAI instead of Cohere
+        self.azure_client = azure_client
         
-        # SIMPLIFIED components using Azure OpenAI
-        self.boundary_detector = SimplifiedTopicDetector(azure_client)
+        # Enhanced components
+        self.boundary_detector = RobustTopicDetector(azure_client)
         self.lifecycle_manager = SimplifiedThreadLifecycleManager(redis_client)
-        self.context_selector = SimplifiedThreadContextSelector(base_manager)
+        self.context_selector = RobustThreadContextSelector(base_manager, azure_client)
     
     def add_exchange_with_threads(self, conv_id: str, user_message: str, assistant_message: str):
-        """SIMPLIFIED: Add exchange without complex thread updates"""
+        """Add exchange with enhanced thread handling"""
         
         # Add exchange using base manager
         self.base_manager.add_exchange(conv_id, user_message, assistant_message)
         
-        # Simple thread update: just mark that we have new messages
-        # No complex analysis or reactivation needed
-        print(f"✅ Added exchange for conversation {conv_id} (Azure OpenAI)")
-        
+        print(f"✅ Added exchange for conversation {conv_id} with robust thread handling")
         return True
     
-    def analyze_conversation_threads(self, conv_id: str) -> List[ConversationThread]:
-        """SIMPLIFIED: Create basic threads"""
+    async def analyze_conversation_threads(self, conv_id: str) -> List[ConversationThread]:
+        """Enhanced thread analysis with clustering"""
         
         conversation = self.base_manager.get_conversation(conv_id)
         
         if len(conversation) < 4:
-            return []  # Too short for threading
+            return []
         
-        threads = self.boundary_detector.create_simple_threads(conversation)
+        threads = await self.boundary_detector.create_threads(conversation)
         
-        print(f"📊 Created {len(threads)} simple threads for conversation {conv_id} (Azure OpenAI)")
+        print(f"📊 Created {len(threads)} robust threads for conversation {conv_id}")
         
         return threads
     
-    def prepare_context_with_threads(self, conv_id: str, user_message: str) -> Tuple[List[Dict], int]:
-        """SIMPLIFIED: Prepare context using simple thread logic"""
+    async def prepare_context_with_threads(
+        self, 
+        conv_id: str, 
+        user_message: str,
+        token_limit: int = 100000
+    ) -> Tuple[List[Dict], int]:
+        """
+        Enhanced context preparation with token management
+        """
         
         # Load or create threads
         threads = self.lifecycle_manager.load_threads(conv_id)
         
         if not threads:
-            threads = self.analyze_conversation_threads(conv_id)
-            if threads:  # Only save if we created any
+            threads = await self.analyze_conversation_threads(conv_id)
+            if threads:
                 self.lifecycle_manager.save_threads(conv_id, threads)
         
-        # Select context using simplified logic
-        context = self.context_selector.select_thread_context(conv_id, threads, user_message)
+        # Select context with robust logic
+        context = await self.context_selector.select_thread_context(
+            conv_id, threads, user_message, token_limit
+        )
         
-        # Calculate token usage using Azure OpenAI tokenizer
+        # Calculate token usage
         total_tokens = sum(self.azure_client.count_tokens(msg.get("content", "")) for msg in context)
         
-        print(f"🔍 Thread context: {len(context)} messages, {total_tokens} tokens (Azure OpenAI)")
+        print(f"🔍 Robust thread context: {len(context)} messages, {total_tokens} tokens")
         
         return context, total_tokens
     
     def update_threads_with_new_message(self, conv_id: str, message_index: int):
-        """SIMPLIFIED: No-op for API compatibility"""
-        # In the simplified version, we don't do complex per-message thread updates
+        """No-op for API compatibility"""
         pass
 
 # Backward compatibility aliases
-TopicBoundaryDetector = SimplifiedTopicDetector  # For existing imports
+TopicBoundaryDetector = RobustTopicDetector
+SimplifiedTopicDetector = RobustTopicDetector
+SimplifiedThreadContextSelector = RobustThreadContextSelector

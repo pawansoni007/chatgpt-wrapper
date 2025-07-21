@@ -16,7 +16,6 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.append(current_dir)
 sys.path.append(parent_dir)
 
-from conversation_memory import EnhancedConversationManager
 from thread_detection_system import ThreadAwareConversationManager
 from intent_classification_system import EnhancedIntentClassifier
 from smart_context_selector import SmartContextSelector
@@ -183,179 +182,6 @@ class ConversationManager:
         except Exception as e:
             print(f"Error storing embedding for message {message_index}: {e}")
     
-    def get_relevant_messages(self, conv_id: str, user_message: str) -> List[Dict]:
-        """Return messages ranked by semantic relevance using Azure OpenAI embeddings"""
-        try:
-            # Get user message embedding using Azure OpenAI
-            user_embedding = self.get_message_embedding(user_message)
-            if not user_embedding:
-                print("Failed to generate Azure OpenAI embedding for user message, falling back to chronological")
-                return []
-            
-            # Get all conversation messages
-            conversation = self.get_conversation(conv_id)
-            if not conversation:
-                return []
-            
-            message_scores = []
-            
-            for idx, message in enumerate(conversation):
-                # Get stored embedding for this message
-                embedding_key = self.get_embedding_key(conv_id, idx)
-                stored_embedding_data = redis_client.get(embedding_key)
-                
-                if stored_embedding_data:
-                    try:
-                        stored_embedding = json.loads(stored_embedding_data)
-                        similarity = self.calculate_cosine_similarity(user_embedding, stored_embedding)
-                        
-                        message_scores.append({
-                            'index': idx,
-                            'message': message,
-                            'similarity': similarity
-                        })
-                    except Exception as e:
-                        print(f"Error processing embedding for message {idx}: {e}")
-                        continue
-                else:
-                    # If no stored embedding, generate and store it using Azure OpenAI
-                    message_content = message.get('content', '')
-                    if message_content:
-                        self.store_message_embedding(conv_id, idx, message_content)
-                        # Try to get the newly stored embedding
-                        stored_embedding_data = redis_client.get(embedding_key)
-                        if stored_embedding_data:
-                            try:
-                                stored_embedding = json.loads(stored_embedding_data)
-                                similarity = self.calculate_cosine_similarity(user_embedding, stored_embedding)
-                                message_scores.append({
-                                    'index': idx,
-                                    'message': message,
-                                    'similarity': similarity
-                                })
-                            except Exception as e:
-                                print(f"Error with newly generated embedding for message {idx}: {e}")
-            
-            # Sort by similarity (highest first)
-            message_scores.sort(key=lambda x: x['similarity'], reverse=True)
-            
-            # Filter by threshold and return
-            relevant_messages = [
-                msg_data for msg_data in message_scores 
-                if msg_data['similarity'] >= self.semantic_similarity_threshold
-            ]
-            
-            print(f"Found {len(relevant_messages)} relevant messages out of {len(conversation)} total (Azure OpenAI)")
-            return relevant_messages
-            
-        except Exception as e:
-            print(f"Error in get_relevant_messages: {e}")
-            return []
-    
-    def prepare_context_simple(self, conv_id: str, user_message: str) -> tuple[List[Dict], int]:
-        """Simple chronological context preparation for shorter conversations"""
-        conversation = self.get_conversation(conv_id)
-        
-        # Calculate token budget
-        user_tokens = self.count_tokens(user_message)
-        available_tokens = self.max_tokens - user_tokens - self.reserved_tokens
-        
-        # System message
-        system_content = (
-            "You are a helpful assistant that maintains conversation context. "
-            "Provide thoughtful, accurate responses based on the conversation history."
-        )
-        system_tokens = self.count_tokens(system_content)
-        
-        # Start building context
-        context = [{"role": "system", "content": system_content}]
-        used_tokens = system_tokens
-        available_tokens -= system_tokens
-        
-        # Add messages from most recent to oldest
-        selected_messages = []
-        for message in reversed(conversation):
-            msg_tokens = self.count_tokens(message.get("content", ""))
-            if used_tokens + msg_tokens <= available_tokens:
-                selected_messages.insert(0, message)  # Insert at beginning to maintain order
-                used_tokens += msg_tokens
-            else:
-                break
-        
-        context.extend(selected_messages)
-        context.append({"role": "user", "content": user_message})
-        
-        print(f"Simple context: {len(selected_messages)} messages, {used_tokens + user_tokens} tokens")
-        return context, used_tokens + user_tokens
-    
-    def prepare_context_semantic(self, conv_id: str, user_message: str) -> tuple[List[Dict], int]:
-        """Semantic context preparation using Azure OpenAI embeddings"""
-        # Calculate token budget
-        user_tokens = self.count_tokens(user_message)
-        available_tokens = self.max_tokens - user_tokens - self.reserved_tokens
-        
-        # System message
-        system_content = (
-            "You are a helpful assistant that maintains conversation context. "
-            "Provide thoughtful, accurate responses based on the conversation history."
-        )
-        system_tokens = self.count_tokens(system_content)
-        context = [{"role": "system", "content": system_content}]
-        used_tokens = system_tokens
-        available_tokens -= system_tokens
-        
-        # Get messages ranked by relevance using Azure OpenAI
-        relevant_messages = self.get_relevant_messages(conv_id, user_message)
-        
-        if not relevant_messages:
-            # Fallback to simple method if semantic fails
-            print("Azure OpenAI semantic selection failed, falling back to simple method")
-            return self.prepare_context_simple(conv_id, user_message)
-        
-        # Add most relevant messages that fit in token budget
-        selected_messages = []
-        for msg_data in relevant_messages:
-            message = msg_data['message']
-            msg_tokens = self.count_tokens(message.get("content", ""))
-            
-            if used_tokens + msg_tokens <= available_tokens:
-                selected_messages.append({
-                    'message': message,
-                    'similarity': msg_data['similarity'],
-                    'original_index': msg_data['index']
-                })
-                used_tokens += msg_tokens
-            else:
-                break
-        
-        # Sort selected messages chronologically to preserve conversation flow
-        selected_messages.sort(key=lambda x: x['original_index'])
-        
-        # Extract just the message objects for context
-        final_messages = [msg_data['message'] for msg_data in selected_messages]
-        context.extend(final_messages)
-        context.append({"role": "user", "content": user_message}) 
-        
-        # Print debug info
-        similarities = [f"{msg_data['similarity']:.3f}" for msg_data in selected_messages]
-        print(f"Azure OpenAI semantic context: {len(final_messages)} messages, {used_tokens + user_tokens} tokens")
-        print(f"Similarities: {similarities}")
-        
-        return context, used_tokens + user_tokens
-    
-    def prepare_context(self, conv_id: str, user_message: str) -> tuple[List[Dict], int]:
-        """Smart context preparation optimized for Azure OpenAI"""
-        conversation = self.get_conversation(conv_id)
-        
-        # For shorter conversations, use simple chronological selection
-        if len(conversation) <= self.simple_conversation_threshold:
-            print(f"Using simple context (conversation length: {len(conversation)})")
-            return self.prepare_context_simple(conv_id, user_message)
-        
-        # For longer conversations, use Azure OpenAI semantic selection
-        print(f"Using Azure OpenAI semantic context (conversation length: {len(conversation)})")
-        return self.prepare_context_semantic(conv_id, user_message)
-    
     async def get_azure_response(self, messages: List[Dict], task_type: str = "chat") -> tuple[str, int]:
         """Get response from Azure OpenAI"""
         try:
@@ -485,7 +311,7 @@ async def chat(request: ChatRequest):
         intent_start_time = time.time() 
         print("1️⃣ Classifying intent with Azure OpenAI GPT-4o-mini...") 
         recent_context = conv_manager.get_conversation(conv_id)[-6:] 
-        intent_result = intent_classifier.classify_intent(request.message, recent_context, conv_id) 
+        intent_result = await intent_classifier.classify_intent(request.message, recent_context, conv_id) 
         intent_duration = time.time() - intent_start_time 
         
         print(f"   Intent: {intent_result.intent.value} (confidence: {intent_result.confidence:.2f})") 
@@ -501,6 +327,9 @@ async def chat(request: ChatRequest):
             conv_id, 
             intent_info=intent_result
         ) 
+
+        print(f"Context Optimized: Summarized={full_context_result.was_summarized}, Similarity={full_context_result.similarity_score:.2f}")
+
         context_duration = time.time() - context_start_time 
         
         print(f"   Context Strategy: {full_context_result.selection_strategy}") 
@@ -562,7 +391,8 @@ async def get_conversation(conversation_id: str):
             "topic": thread.topic,
             "status": thread.status.value,
             "message_indices": thread.messages,
-            "confidence": thread.confidence_score
+            "confidence": thread.confidence_score,
+            "summary": thread.summary  # New
         })
     
     return {

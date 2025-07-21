@@ -65,7 +65,24 @@ class AzureOpenAIClient:
             
         except Exception as e:
             raise Exception(f"Failed to initialize Azure OpenAI client: {e}")
-    
+
+    async def generate_summary(self, content: List[str]) -> str:
+        """
+        Generate a concise, well-formatted summary of the provided content.
+        """
+        summary_prompt = (
+            "Summarize the following conversation history concisely, preserving key points and tasks. "
+            "Format the summary with bullet points or numbered lists for clarity:\n\n"
+            + "\n".join(content[:10])  # Limit to first 10 for efficiency
+        )
+        response = await self.chat_completion(
+            [{"role": "user", "content": summary_prompt}],
+            task_type="chat",
+            temperature=0.2,
+            max_tokens=500
+        )
+        return response.content
+
     async def chat_completion(
         self, 
         messages: List[Dict],

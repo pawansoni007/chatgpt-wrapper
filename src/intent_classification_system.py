@@ -198,7 +198,7 @@ class EnhancedIntentClassifier:
 
         Your entire response must be valid JSON only."""
 
-    def classify_intent(self, user_message: str, recent_context: List[Dict] = None, conv_id: str = None) -> IntentClassification:
+    async def classify_intent(self, user_message: str, recent_context: List[Dict] = None, conv_id: str = None) -> IntentClassification:
         """
         Azure OpenAI powered intent classification with stability enhancements
         
@@ -231,12 +231,12 @@ class EnhancedIntentClassifier:
             prompt = self._build_classification_prompt(user_message, recent_context)
             
             # Use Azure OpenAI with very low temperature for consistency
-            response = asyncio.run(self.azure_client.chat_completion(
+            response = await self.azure_client.chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 task_type="intent",  # This will use GPT-4o-mini
                 temperature=0.05,    # VERY low temperature for maximum consistency
                 max_tokens=300
-            ))
+            )
             
             print(f"✅ Intent classified using Azure OpenAI {response.model_used}")
             

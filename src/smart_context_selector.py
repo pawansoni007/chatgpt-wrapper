@@ -27,6 +27,8 @@ class ComprehensiveContextResult:
     semantic_scores: List[float]  # Semantic similarity scores for selected messages
     selection_strategy: str       # Strategy used for selection
     debug_info: Dict             # Detailed debug information
+    was_summarized: bool = False  # New: Flag if context was condensed
+    similarity_score: float = 0.0  # New: Highest relevance score from matching
 
 class ContextSelectionStrategy(Enum):
     """SIMPLIFIED: Only 2 strategies for predictable behavior"""
@@ -52,6 +54,8 @@ class SmartContextSelector:
             thread_manager: Optional thread detection system
             memory_manager: Optional (deprecated, not used)
         """
+        self.similarity_threshold = 0.7  # For relevance matching (tunable)
+
         # Note: parameter is named cohere_client for backward compatibility, but it's actually Azure OpenAI
         self.azure_client = cohere_client  # This is actually the Azure OpenAI client now
         self.conv_manager = conversation_manager
@@ -140,43 +144,69 @@ class SmartContextSelector:
         return ContextSelectionStrategy.SEMANTIC_HYBRID
         
     def _semantic_hybrid_selection(self, user_message: str, conv_id: str, conversation: List[Dict]) -> ComprehensiveContextResult:
-        """
-        IMPROVED semantic hybrid selection that delegates to thread manager if available
-        """
         print("🎨 Using comprehensive semantic+thread context selection (Azure OpenAI).")
         
         if not self.thread_manager:
             print("⚠️ Thread manager not available. Using recent context with semantic boost.")
             return self._recent_fallback_selection(user_message, conv_id, conversation)
-
+        
         try:
-            # Delegate to the specialized thread-aware manager
+            # Load threads (existing)
+            threads = self.thread_manager.lifecycle_manager.load_threads(conv_id)
+            
+            if not threads:
+                return self._recent_fallback_selection(user_message, conv_id, conversation)
+            
+            # New: Embed user message for relevance
+            user_emb = self.azure_client.get_embedding(user_message)
+            
+            # New: Find best thread by cosine similarity
+            similarities = []
+            for thread in threads:
+                thread_text = thread.topic or " ".join([conversation[i]["content"][:200] for i in thread.messages[:3]])
+                thread_emb = self.azure_client.get_embedding(thread_text)
+                sim = np.dot(user_emb, thread_emb) / (np.linalg.norm(user_emb) * np.linalg.norm(thread_emb))
+                similarities.append(sim)
+            
+            best_thread_idx = np.argmax(similarities)
+            best_thread = threads[best_thread_idx]
+            max_sim = similarities[best_thread_idx]
+            
+            print(f"🔍 Best thread match: {best_thread.topic} (similarity: {max_sim:.2f})")
+            
+            # Delegate to thread manager (existing, but now informed by best thread)
             context, tokens = self.thread_manager.prepare_context_with_threads(conv_id, user_message)
             
-            # Extract thread information for the result
-            threads = self.thread_manager.lifecycle_manager.load_threads(conv_id)
+            # Optimize tokens after building context
+            context, tokens_used, was_summarized = self._optimize_tokens(context, user_message, tokens)
+
+            # Extract thread info (existing)
             active_threads = [t for t in threads if t.status.value == "active"]
-            relevant_thread_ids = [t.thread_id for t in active_threads[:2]]
+            relevant_thread_ids = [best_thread.thread_id] + [t.thread_id for t in active_threads[:1]]  # Prioritize best
             
             return ComprehensiveContextResult(
                 context=context,
                 tokens_used=tokens,
                 relevant_threads=relevant_thread_ids,
-                memory_factors=["Azure OpenAI thread-aware context selection"],
-                semantic_scores=[],
+                memory_factors=["Azure OpenAI thread-aware with relevance matching"],
+                semantic_scores=[max_sim],
                 selection_strategy=ContextSelectionStrategy.SEMANTIC_HYBRID.value,
                 debug_info={
-                    "method": "Azure OpenAI Thread-aware delegation",
+                    "method": "Azure OpenAI Thread-aware with semantic relevance",
                     "total_threads": len(threads),
                     "active_threads": len(active_threads),
-                    "context_messages": len(context)
-                }
+                    "context_messages": len(context),
+                    "best_similarity": max_sim
+                },
+                similarity_score=max_sim,  # New field,
+                was_summarized=was_summarized,  # New field
+                similarity_score=max_sim        # New field (already in your file)
             )
-
         except Exception as e:
             print(f"❌ Thread-aware context failed: {e}. Falling back to recent context.")
             return self._recent_fallback_selection(user_message, conv_id, conversation)
-    
+
+   
     def _recent_fallback_selection(self, user_message: str, conv_id: str, conversation: List[Dict]) -> ComprehensiveContextResult:
         """
         IMPROVED recent fallback selection with better token utilization
@@ -215,6 +245,9 @@ class SmartContextSelector:
         # Add current user message
         context.append({"role": "user", "content": user_message})
         total_tokens = tokens_used + user_tokens
+
+        # Optimize tokens after building context
+        context, tokens_used, was_summarized = self._optimize_tokens(context, user_message, total_tokens)
         
         return ComprehensiveContextResult(
             context=context,
@@ -229,8 +262,35 @@ class SmartContextSelector:
                 "messages_used": len(selected_messages),
                 "tokens_available": available_for_history,
                 "tokens_used": total_tokens
-            }
+            },
+            was_summarized=was_summarized  # New field
         )
+    
+    def _optimize_tokens(self, context: List[Dict], user_message: str, tokens_used: int) -> Tuple[List[Dict], int, bool]:
+        """
+        Optimize context by summarizing if token usage is high.
+        
+        Args:
+            context: Current context list
+            user_message: The user's latest message (for rebuilding)
+            tokens_used: Current token count
+            
+        Returns:
+            Tuple of (optimized_context, new_tokens_used, was_summarized)
+        """
+        if tokens_used > self.available_tokens * 0.8:
+            print("⚠️ High token usage detected. Summarizing context...")
+            # Summarize excluding system (index 0) and user message (last item)
+            to_summarize = context[1:-1] if len(context) > 2 else []
+            # Extract content for summarization
+            summary_content = [msg["content"] for msg in to_summarize]
+            summarized = self.azure_client.generate_summary(summary_content)
+            # Rebuild: Keep original system, add summary as system message, add user
+            new_context = [context[0]] + [{"role": "system", "content": f"Summarized history: {summarized}"}] + [{"role": "user", "content": user_message}]
+            new_tokens = sum(self._count_tokens(msg["content"]) for msg in new_context)
+            return new_context, new_tokens, True
+        return context, tokens_used, False
+
      
     def _count_tokens(self, text: str) -> int:
         """Count tokens using Azure OpenAI tokenizer"""
