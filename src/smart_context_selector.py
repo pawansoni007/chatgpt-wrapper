@@ -200,7 +200,6 @@ class SmartContextSelector:
                 },
                 similarity_score=max_sim,  # New field,
                 was_summarized=was_summarized,  # New field
-                similarity_score=max_sim        # New field (already in your file)
             )
         except Exception as e:
             print(f"❌ Thread-aware context failed: {e}. Falling back to recent context.")
