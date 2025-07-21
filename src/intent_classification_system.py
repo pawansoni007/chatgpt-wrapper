@@ -233,7 +233,7 @@ class EnhancedIntentClassifier:
             # Use Azure OpenAI with very low temperature for consistency
             response = await self.azure_client.chat_completion(
                 messages=[{"role": "user", "content": prompt}],
-                task_type="intent",  # This will use GPT-4o-mini
+                task_type="intent",  # This will use GPT-4o
                 temperature=0.05,    # VERY low temperature for maximum consistency
                 max_tokens=300
             )

@@ -244,16 +244,18 @@ class ConversationManager:
 
 # Initialize conversation manager
 conv_manager = ConversationManager()
+# Initialize Intent Classification System with Azure OpenAI
+intent_classifier = EnhancedIntentClassifier(azure_client)
 
-# Initialize Thread-Aware Manager with Azure OpenAI
+# Initialize Thread-Aware Manager with Azure OpenAI and Intent Classifier
 thread_aware_manager = ThreadAwareConversationManager(
     conv_manager,
     azure_client,  # Pass Azure client instead of Cohere
-    redis_client
+    redis_client,
+    intent_classifier  # Pass intent classifier for smart context selection
 )
 
-# Initialize Intent Classification System with Azure OpenAI
-intent_classifier = EnhancedIntentClassifier(azure_client)
+
 
 # Initialize SmartContextSelector with Azure OpenAI
 smart_context_selector = SmartContextSelector(
@@ -319,26 +321,27 @@ async def chat(request: ChatRequest):
         if intent_result.requires_clarification: 
             print(f"   Clarification needed: {intent_result.clarification_reason}") 
         
-        # --- Stage 2: Get Comprehensive Context --- 
-        context_start_time = time.time() 
-        print("2️⃣ Building comprehensive context with Azure OpenAI embeddings...") 
-        full_context_result = smart_context_selector.get_comprehensive_context( 
-            request.message, 
-            conv_id, 
-            intent_info=intent_result
-        ) 
-
-        print(f"Context Optimized: Summarized={full_context_result.was_summarized}, Similarity={full_context_result.similarity_score:.2f}")
-
-        context_duration = time.time() - context_start_time 
+        # --- Stage 2: Get Intent-Aware Thread Context ---
+        context_start_time = time.time()
+        print("2️⃣ Building intent-aware thread context...")
         
-        print(f"   Context Strategy: {full_context_result.selection_strategy}") 
-        print(f"   Context size: {len(full_context_result.context)} messages, {full_context_result.tokens_used} tokens") 
+        # Use the new thread-aware context selection with intent
+        context, tokens_used, strategy_used = await thread_aware_manager.prepare_context_with_threads(
+            conv_id, 
+            request.message,
+            intent_result,  # Pass intent classification result
+            token_limit=120000
+        )
+        
+        context_duration = time.time() - context_start_time
+        
+        print(f"   Intent-Based Strategy: {strategy_used}")
+        print(f"   Context size: {len(context)} messages, {tokens_used} tokens")
+        print(f"   Intent: {intent_result.intent.value} → Strategy: {strategy_used}") 
         
         # --- Stage 3: Generate Response with Azure OpenAI GPT-4o --- 
         response_start_time = time.time() 
         print("3️⃣ Generating response with Azure OpenAI GPT-4o...") 
-        context = full_context_result.context 
         response_content, actual_tokens = await conv_manager.get_azure_response(context, task_type="chat")
         response_duration = time.time() - response_start_time 
         
@@ -368,6 +371,95 @@ async def chat(request: ChatRequest):
 async def get_azure_status():
     """Get Azure OpenAI client status"""
     return azure_client.get_status()
+
+@app.get("/thread-metrics")
+async def get_thread_metrics():
+    """Get thread detection and context selection performance metrics"""
+    try:
+        metrics = thread_aware_manager.get_performance_metrics()
+        return {
+            "status": "success",
+            "metrics": metrics,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error retrieving metrics: {str(e)}")
+
+@app.post("/tune-thread-parameters")
+async def tune_thread_parameters(parameters: dict):
+    """
+    Runtime tuning of thread detection parameters
+    
+    Accepted parameters:
+    - dbscan_eps: float (0.1-1.0) - DBSCAN clustering sensitivity
+    - dbscan_min_samples: int (2-10) - Minimum samples per cluster
+    - continuation_threshold: float (0.5-0.95) - Token threshold for continuation strategy
+    - semantic_threshold: float (0.5-0.95) - Token threshold for semantic strategy  
+    - max_threads_to_check: int (5-50) - Maximum threads to check for similarity
+    - intent_confidence_threshold: float (0.5-0.9) - Minimum confidence for intent
+    """
+    try:
+        # Validate parameters
+        valid_params = {}
+        
+        if 'dbscan_eps' in parameters:
+            eps = float(parameters['dbscan_eps'])
+            if 0.1 <= eps <= 1.0:
+                valid_params['dbscan_eps'] = eps
+            else:
+                raise ValueError("dbscan_eps must be between 0.1 and 1.0")
+        
+        if 'dbscan_min_samples' in parameters:
+            min_samples = int(parameters['dbscan_min_samples'])
+            if 2 <= min_samples <= 10:
+                valid_params['dbscan_min_samples'] = min_samples
+            else:
+                raise ValueError("dbscan_min_samples must be between 2 and 10")
+        
+        if 'continuation_threshold' in parameters:
+            threshold = float(parameters['continuation_threshold'])
+            if 0.5 <= threshold <= 0.95:
+                valid_params['continuation_threshold'] = threshold
+            else:
+                raise ValueError("continuation_threshold must be between 0.5 and 0.95")
+                
+        if 'semantic_threshold' in parameters:
+            threshold = float(parameters['semantic_threshold'])
+            if 0.5 <= threshold <= 0.95:
+                valid_params['semantic_threshold'] = threshold
+            else:
+                raise ValueError("semantic_threshold must be between 0.5 and 0.95")
+        
+        if 'max_threads_to_check' in parameters:
+            max_threads = int(parameters['max_threads_to_check'])
+            if 5 <= max_threads <= 50:
+                valid_params['max_threads_to_check'] = max_threads
+            else:
+                raise ValueError("max_threads_to_check must be between 5 and 50")
+        
+        if 'intent_confidence_threshold' in parameters:
+            threshold = float(parameters['intent_confidence_threshold'])
+            if 0.5 <= threshold <= 0.9:
+                valid_params['intent_confidence_threshold'] = threshold
+            else:
+                raise ValueError("intent_confidence_threshold must be between 0.5 and 0.9")
+        
+        if not valid_params:
+            raise ValueError("No valid parameters provided")
+        
+        # Apply tuning
+        thread_aware_manager.tune_parameters(**valid_params)
+        
+        return {
+            "status": "success",
+            "updated_parameters": valid_params,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error tuning parameters: {str(e)}")
 
 # [Rest of the routes remain the same - get_conversation, delete_conversation, etc.]
 # I'll add key ones but keeping response shorter
