@@ -464,6 +464,50 @@ async def tune_thread_parameters(parameters: dict):
 # [Rest of the routes remain the same - get_conversation, delete_conversation, etc.]
 # I'll add key ones but keeping response shorter
 
+@app.get("/conversations")
+async def list_conversations():
+    """Get list of all conversations with metadata"""
+    try:
+        # Get all conversation keys from Redis
+        conversation_keys = redis_client.keys("conversation:*")
+        conversations = []
+        
+        for key in conversation_keys:
+            # Extract conversation_id from key (format: "conversation:uuid")
+            conv_id = key.split(":", 1)[1]
+            
+            # Get metadata
+            metadata = conv_manager.get_conversation_metadata(conv_id)
+            if metadata:
+                # Get basic conversation info
+                conversation = conv_manager.get_conversation(conv_id)
+                
+                # Get thread count
+                threads = thread_aware_manager.lifecycle_manager.load_threads(conv_id)
+                
+                conversations.append({
+                    "conversation_id": conv_id,
+                    "message_count": len(conversation),
+                    "created_at": metadata.get("created_at"),
+                    "last_updated": metadata.get("last_updated"),
+                    "total_tokens": metadata.get("total_tokens", 0),
+                    "thread_count": len(threads),
+                    "active_threads": len([t for t in threads if t.status.value == "active"]),
+                    "latest_message": conversation[-1].get("content", "")[:100] + "..." if conversation else ""
+                })
+        
+        # Sort by last updated (most recent first)
+        conversations.sort(key=lambda x: x.get("last_updated", ""), reverse=True)
+        
+        return {
+            "total_conversations": len(conversations),
+            "conversations": conversations
+        }
+        
+    except Exception as e:
+        print(f"Error listing conversations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve conversations")
+
 @app.get("/conversations/{conversation_id}")
 async def get_conversation(conversation_id: str):
     """Get full conversation history with thread information"""
